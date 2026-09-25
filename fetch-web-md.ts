@@ -1,8 +1,11 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as ipaddr from "ipaddr.js";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { convertLocalSource } from "./local-convert.js";
+import { fetchLocalSource } from "./local-fetch.js";
+import { validateUrl } from "./url-safety.js";
+export { validateUrl } from "./url-safety.js";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -14,10 +17,7 @@ import {
 
 const MARKDOWN_NEW_URL = "https://markdown.new/";
 const TIMEOUT_MS = 30_000;
-const MAX_URL_LENGTH = 8_192;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
-const LOCAL_HOST_SUFFIXES = [".localhost", ".local", ".internal"];
-
 const FetchWebMdParams = Type.Object({
   url: Type.String({
     description: "Public http(s) URL to convert to clean Markdown",
@@ -56,6 +56,10 @@ interface FetchWebMdDetails {
   durationMs?: number;
   markdownTokens?: string;
   rateLimitRemaining?: string;
+  fallback?: boolean;
+  primaryError?: string;
+  warnings?: string[];
+  partial?: boolean;
   truncation?: ReturnType<typeof truncateHead>;
   fullOutputPath?: string;
 }
@@ -64,55 +68,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isPublicIpAddress(hostname: string): boolean {
-  if (!ipaddr.isValid(hostname)) return false;
-  return ipaddr.process(hostname).range() === "unicast";
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-function validateHostname(hostname: string): void {
-  const normalizedHostname = hostname.toLowerCase().replace(/\.$/, "");
-  const ipLiteral = normalizedHostname.replace(/^\[|\]$/g, "");
-
-  if (ipaddr.isValid(ipLiteral)) {
-    if (!isPublicIpAddress(ipLiteral)) {
-      throw new Error("url must not target a private, local, or reserved IP address.");
-    }
-    return;
-  }
-
-  if (
-    normalizedHostname === "localhost" ||
-    LOCAL_HOST_SUFFIXES.some((suffix) => normalizedHostname.endsWith(suffix)) ||
-    !normalizedHostname.includes(".")
-  ) {
-    throw new Error("url must include a public hostname.");
-  }
+function shouldUseLocalFallback(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  return !errorMessage(error).includes("response exceeds the 10.0MB limit");
 }
 
-export function validateUrl(value: string): string {
-  if (value.length > MAX_URL_LENGTH) {
-    throw new Error(`URL exceeds the ${MAX_URL_LENGTH}-character limit.`);
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error("url must be a valid absolute http(s) URL.");
-  }
-
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("url must use the http or https protocol.");
-  }
-  if (!parsed.hostname) {
-    throw new Error("url must include a hostname.");
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error("url must not contain credentials.");
-  }
-
-  validateHostname(parsed.hostname);
-  return parsed.toString();
+function browserAdvice(pi: ExtensionAPI): string | undefined {
+  const activeTools = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
+  return activeTools.some((name) => name.startsWith("browser_"))
+    ? "Use the available browser_* tools to render and inspect the page."
+    : undefined;
 }
 
 function responseSizeError(): Error {
@@ -244,48 +213,88 @@ export default function (pi: ExtensionAPI) {
     name: "fetch_web_md",
     label: "Fetch Web Markdown",
     description:
-      `Convert a public web URL to clean Markdown via markdown.new. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
-    promptSnippet: "Fetch a public web page as clean Markdown via markdown.new",
+      `Convert a public web URL to clean Markdown via markdown.new, with a bounded static local fallback when that service fails. JavaScript-rendered pages may be incomplete; use browser_* tools when advised. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
+    promptSnippet: "Fetch a public web page as clean Markdown with markdown.new and static fallback",
     promptGuidelines: [
       "Use fetch_web_md to read or research a public web page when its Markdown content is needed.",
+      "When this tool marks a result incomplete and browser_* tools are available, use browser tools for the rendered page.",
     ],
     parameters: FetchWebMdParams,
 
     async execute(_toolCallId, params, signal) {
       const url = validateUrl(params.url);
       const method = (params.method ?? "auto") as ConversionMethod;
-      const { payload, response } = await convertToMarkdown(
-        {
-          url,
+      let markdown: string;
+      let details: FetchWebMdDetails;
+      try {
+        const { payload, response } = await convertToMarkdown(
+          {
+            url,
+            method,
+            retain_images: params.retain_images ?? false,
+          },
+          signal,
+        );
+        if (typeof payload.content !== "string" || payload.content.length === 0) {
+          throw new Error("markdown.new returned no Markdown content.");
+        }
+        markdown = payload.content;
+        details = {
+          requestedUrl: url,
+          sourceUrl: typeof payload.url === "string" ? payload.url : url,
+          title: typeof payload.title === "string" ? payload.title : undefined,
           method,
-          retain_images: params.retain_images ?? false,
-        },
-        signal,
-      );
-
-      if (typeof payload.content !== "string" || payload.content.length === 0) {
-        throw new Error("markdown.new returned no Markdown content.");
+          conversionMethod: typeof payload.method === "string" ? payload.method : undefined,
+          durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : undefined,
+          markdownTokens: response.headers.get("x-markdown-tokens") ?? undefined,
+          rateLimitRemaining: response.headers.get("x-rate-limit-remaining") ?? undefined,
+        };
+      } catch (primaryError) {
+        if (!shouldUseLocalFallback(primaryError, signal)) throw primaryError;
+        try {
+          const source = await fetchLocalSource(url, {
+            signal,
+            retainImages: params.retain_images ?? false,
+          });
+          const local = convertLocalSource(source, params.retain_images ?? false);
+          const warnings = [...local.warnings];
+          if (method === "browser") {
+            warnings.push("The local fallback cannot execute JavaScript, despite method: browser.");
+          }
+          if (local.partial) {
+            warnings.push(browserAdvice(pi) ?? "Static extraction may be incomplete because this page needs client-side rendering.");
+          }
+          markdown = local.content;
+          if (warnings.length > 0) {
+            markdown += `\n> **${local.partial ? "Incomplete static fallback" : "Fallback note"}:** ${warnings.join(" ")}\n`;
+          }
+          details = {
+            requestedUrl: url,
+            sourceUrl: local.sourceUrl,
+            title: local.title,
+            method,
+            conversionMethod: local.conversionMethod,
+            fallback: true,
+            primaryError: errorMessage(primaryError),
+            warnings,
+            partial: local.partial,
+          };
+        } catch (fallbackError) {
+          const advice = browserAdvice(pi);
+          throw new Error(
+            `${errorMessage(primaryError)} Local fallback failed: ${errorMessage(fallbackError)}${advice ? ` ${advice}` : ""}`,
+            { cause: fallbackError },
+          );
+        }
       }
 
-      const sourceUrl = typeof payload.url === "string" ? payload.url : url;
-      const truncation = truncateHead(payload.content, {
+      const truncation = truncateHead(markdown, {
         maxLines: DEFAULT_MAX_LINES,
         maxBytes: DEFAULT_MAX_BYTES,
       });
-      const details: FetchWebMdDetails = {
-        requestedUrl: url,
-        sourceUrl,
-        title: typeof payload.title === "string" ? payload.title : undefined,
-        method,
-        conversionMethod: typeof payload.method === "string" ? payload.method : undefined,
-        durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : undefined,
-        markdownTokens: response.headers.get("x-markdown-tokens") ?? undefined,
-        rateLimitRemaining: response.headers.get("x-rate-limit-remaining") ?? undefined,
-      };
-
       let text = truncation.content;
       if (truncation.truncated) {
-        const fullOutputPath = await saveFullOutput(payload.content);
+        const fullOutputPath = await saveFullOutput(markdown);
         details.truncation = truncation;
         details.fullOutputPath = fullOutputPath;
         text += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output saved to: ${fullOutputPath}]`;

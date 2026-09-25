@@ -80,9 +80,10 @@ describe("fetch_web_md extension", () => {
     expect(tool).toMatchObject({
       name: "fetch_web_md",
       label: "Fetch Web Markdown",
-      promptSnippet: "Fetch a public web page as clean Markdown via markdown.new",
+      promptSnippet: "Fetch a public web page as clean Markdown with markdown.new and static fallback",
       promptGuidelines: [
         "Use fetch_web_md to read or research a public web page when its Markdown content is needed.",
+        "When this tool marks a result incomplete and browser_* tools are available, use browser tools for the rendered page.",
       ],
     });
     expect(tool.description).toContain("Output is truncated");

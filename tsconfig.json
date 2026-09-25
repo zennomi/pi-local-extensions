@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["index.ts", "fetch-web-md.ts", "tests/**/*.ts"]
+  "include": ["*.ts", "*.d.ts", "tests/**/*.ts"]
 }
