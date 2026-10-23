@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockAgent } from "undici";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import extension from "../fetch-web-md.js";
-import { convertLocalSource } from "../local-convert.js";
-import { setLocalDispatcherForTesting } from "../local-fetch.js";
+import extension from "../../extensions/web-fetch/index.js";
+import { convertLocalSource } from "../../extensions/web-fetch/local-convert.js";
+import { setLocalDispatcherForTesting } from "../../extensions/web-fetch/local-fetch.js";
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;

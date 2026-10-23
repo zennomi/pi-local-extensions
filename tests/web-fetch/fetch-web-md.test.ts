@@ -2,7 +2,7 @@ import { readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import extension, { validateUrl } from "../fetch-web-md.js";
+import extension, { validateUrl } from "../../extensions/web-fetch/index.js";
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
