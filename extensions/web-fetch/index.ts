@@ -2,6 +2,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { ProxyAgent, type Dispatcher } from "undici";
 import { convertLocalSource } from "./local-convert.js";
 import { fetchLocalSource } from "./local-fetch.js";
 import { validateUrl } from "./url-safety.js";
@@ -56,6 +57,7 @@ interface FetchWebMdDetails {
   durationMs?: number;
   markdownTokens?: string;
   rateLimitRemaining?: string;
+  usedProxy?: boolean;
   fallback?: boolean;
   primaryError?: string;
   warnings?: string[];
@@ -70,6 +72,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+class MarkdownNewError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly rateLimited: boolean,
+  ) {
+    super(message);
+    this.name = "MarkdownNewError";
+  }
+}
+
+function hasRateLimitSignal(value: string | undefined): boolean {
+  return value !== undefined && /rate[ -]?limit|too many requests|throttl|quota|request limit/i.test(value);
+}
+
+function rotateProxyUrl(): string | undefined {
+  const value = process.env.ROTATE_PROXY_URL?.trim();
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function shouldUseLocalFallback(error: unknown, signal?: AbortSignal): boolean {
@@ -139,19 +169,27 @@ function parsePayload(raw: string, response: Response): MarkdownNewResponse | un
   }
 }
 
-function upstreamFailure(response: Response, payload?: MarkdownNewResponse): Error {
+function upstreamFailure(response: Response, payload?: MarkdownNewResponse): MarkdownNewError {
   const apiError = typeof payload?.error === "string" ? payload.error : undefined;
   const reason =
     apiError ??
     (response.status === 429
       ? "Rate limit exceeded; try again later."
       : response.statusText || "Request failed.");
-  return new Error(`markdown.new conversion failed (${response.status}): ${reason}`);
+  const remaining =
+    response.headers.get("x-rate-limit-remaining") ?? response.headers.get("x-ratelimit-remaining");
+  const rateLimited = response.status === 429 || remaining === "0" || hasRateLimitSignal(reason);
+  return new MarkdownNewError(
+    `markdown.new conversion failed (${response.status}): ${reason}`,
+    response.status,
+    rateLimited,
+  );
 }
 
 async function convertToMarkdown(
   body: Record<string, unknown>,
   signal?: AbortSignal,
+  dispatcher?: Dispatcher,
 ): Promise<{ payload: MarkdownNewResponse; response: Response }> {
   if (signal?.aborted) {
     throw new Error("markdown.new request was aborted.", { cause: signal.reason });
@@ -168,7 +206,7 @@ async function convertToMarkdown(
   }, TIMEOUT_MS);
 
   try {
-    const response = await fetch(MARKDOWN_NEW_URL, {
+    const request: RequestInit & { dispatcher?: Dispatcher } = {
       method: "POST",
       headers: {
         Accept: "application/json",
@@ -176,7 +214,10 @@ async function convertToMarkdown(
       },
       body: JSON.stringify(body),
       signal: controller.signal,
-    });
+    };
+    if (dispatcher) request.dispatcher = dispatcher;
+
+    const response = await fetch(MARKDOWN_NEW_URL, request);
     const raw = await readResponseText(response);
     const payload = parsePayload(raw, response);
 
@@ -201,6 +242,45 @@ async function convertToMarkdown(
   }
 }
 
+async function convertToMarkdownWithProxyFallback(
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ payload: MarkdownNewResponse; response: Response; usedProxy?: boolean }> {
+  try {
+    return await convertToMarkdown(body, signal);
+  } catch (primaryError) {
+    if (!(primaryError instanceof MarkdownNewError) || !primaryError.rateLimited || signal?.aborted) {
+      throw primaryError;
+    }
+
+    const proxyUrl = rotateProxyUrl();
+    if (!proxyUrl) throw primaryError;
+
+    let proxy: ProxyAgent;
+    try {
+      proxy = new ProxyAgent(proxyUrl);
+    } catch (proxyError) {
+      throw new Error(
+        `${errorMessage(primaryError)} Proxy fallback is unavailable because ROTATE_PROXY_URL is invalid.`,
+        { cause: proxyError },
+      );
+    }
+
+    try {
+      const result = await convertToMarkdown(body, signal, proxy);
+      return { ...result, usedProxy: true };
+    } catch (proxyError) {
+      if (signal?.aborted) throw proxyError;
+      throw new Error(
+        `${errorMessage(primaryError)} Proxy retry via ROTATE_PROXY_URL failed: ${errorMessage(proxyError)}`,
+        { cause: proxyError },
+      );
+    } finally {
+      await proxy.close().catch(() => undefined);
+    }
+  }
+}
+
 async function saveFullOutput(content: string): Promise<string> {
   const tempDirectory = await mkdtemp(join(tmpdir(), "pi-fetch-web-md-"));
   const fullOutputPath = join(tempDirectory, "page.md");
@@ -213,7 +293,7 @@ export default function (pi: ExtensionAPI) {
     name: "fetch_web_md",
     label: "Fetch Web Markdown",
     description:
-      `Convert a public web URL to clean Markdown via markdown.new, with a bounded static local fallback when that service fails. JavaScript-rendered pages may be incomplete; use browser_* tools when advised. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
+      `Convert a public web URL to clean Markdown via markdown.new, retrying rate-limited requests through $ROTATE_PROXY_URL when configured, then using a bounded static local fallback. JavaScript-rendered pages may be incomplete; use browser_* tools when advised. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
     promptSnippet: "Fetch a public web page as clean Markdown with markdown.new and static fallback",
     promptGuidelines: [
       "Use fetch_web_md to read or research a public web page when its Markdown content is needed.",
@@ -227,7 +307,7 @@ export default function (pi: ExtensionAPI) {
       let markdown: string;
       let details: FetchWebMdDetails;
       try {
-        const { payload, response } = await convertToMarkdown(
+        const { payload, response, usedProxy } = await convertToMarkdownWithProxyFallback(
           {
             url,
             method,
@@ -248,6 +328,7 @@ export default function (pi: ExtensionAPI) {
           durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : undefined,
           markdownTokens: response.headers.get("x-markdown-tokens") ?? undefined,
           rateLimitRemaining: response.headers.get("x-rate-limit-remaining") ?? undefined,
+          usedProxy,
         };
       } catch (primaryError) {
         if (!shouldUseLocalFallback(primaryError, signal)) throw primaryError;

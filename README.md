@@ -6,7 +6,7 @@ independent and can be loaded or disabled separately.
 
 | Extension | Entry point | Purpose |
 |---|---|---|
-| [web-fetch](./extensions/web-fetch/README.md) | `extensions/web-fetch/index.ts` | `fetch_web_md` tool: web page → Markdown via markdown.new with a static local fallback |
+| [web-fetch](./extensions/web-fetch/README.md) | `extensions/web-fetch/index.ts` | `fetch_web_md` tool: web page → Markdown via markdown.new, proxy retry, and static fallback |
 | [browser-autoconnect](./extensions/browser-autoconnect/README.md) | `extensions/browser-autoconnect/index.ts` | Runs `/browser-setup` at interactive startup when `pi-browser-harness` is enabled |
 | [empty-response-retry](./extensions/empty-response-retry/README.md) | `extensions/empty-response-retry/index.ts` | Retries empty final responses, then tries Gemini and Claude fallbacks |
 

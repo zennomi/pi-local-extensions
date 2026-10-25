@@ -71,6 +71,7 @@ function abortingFetch() {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("fetch_web_md extension", () => {
@@ -165,6 +166,23 @@ describe("fetch_web_md extension", () => {
   it("accepts public DNS names and public IPv4 literals", () => {
     expect(validateUrl("https://example.com")).toBe("https://example.com/");
     expect(validateUrl("https://8.8.8.8/path")).toBe("https://8.8.8.8/path");
+  });
+
+  it("retries a rate-limited markdown.new request through ROTATE_PROXY_URL", async () => {
+    vi.stubEnv("ROTATE_PROXY_URL", "http://proxy.example.test:8080");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: "Daily limit reached" }, 429))
+      .mockResolvedValueOnce(jsonResponse(successfulPayload("# Via proxy\n")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await getTool().execute("call-proxy", { url: "https://example.com" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, proxyRequest] = (fetchMock.mock.calls as unknown as [string, RequestInit][]) [1]!;
+    expect((proxyRequest as RequestInit & { dispatcher?: unknown }).dispatcher).toBeDefined();
+    expect(result.content).toEqual([{ type: "text", text: "# Via proxy\n" }]);
+    expect(result.details).toMatchObject({ usedProxy: true });
   });
 
   it("surfaces HTTP failures and rate limiting", async () => {

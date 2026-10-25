@@ -28,9 +28,17 @@ fetch_web_md({
 
 The tool sends a JSON POST request to `https://markdown.new/` first and returns its Markdown content plus structured metadata such as title, conversion method, duration, token estimate, and remaining rate-limit value when supplied by the service.
 
+When the converter reports an IP/rate limit (HTTP 429, an exhausted rate-limit header, or a rate-limit error message), the extension retries the converter once through the HTTP(S) proxy in `$ROTATE_PROXY_URL`, when configured. For example:
+
+```bash
+export ROTATE_PROXY_URL='http://user:password@proxy.example:8080'
+```
+
+The proxy is used only for the converter retry; the static fallback still fetches the requested page directly with its normal SSRF protections.
+
 ## Local fallback
 
-On an upstream transport/conversion failure (including rate limits), the extension makes a small, static fallback attempt. It does **not** run for invalid URLs, caller cancellation, or an oversized markdown.new response.
+After the direct request and any rate-limit proxy retry fail, the extension makes a small, static fallback attempt. It does **not** run for invalid URLs, caller cancellation, or an oversized markdown.new response.
 
 The fallback tries, in order:
 
@@ -48,12 +56,12 @@ Fallback details include `fallback`, `primaryError`, `warnings`, and `partial`, 
 
 ## Limits and safety
 
-- markdown.new requests time out after **30 seconds**, including response-body reading. Local requests use a **20-second** per-request timeout, at most **8** requests and **5** redirects for one fallback attempt.
+- Each markdown.new request (including one rate-limit proxy retry) times out after **30 seconds**, including response-body reading. Local requests use a **20-second** per-request timeout, at most **8** requests and **5** redirects for one fallback attempt.
 - Every response body is capped at **10 MiB** (both declared and streaming body size) before parsing.
 - Direct local requests validate each URL and redirect, restrict to public HTTP(S) destinations, and use a DNS lookup that validates and pins the selected public address for the connection. This reduces DNS-rebinding risk; it cannot make arbitrary third-party content safe or override a proxy's network policy.
 - Model-facing output is capped at Pi's standard **2,000 lines or 50 KiB**. When that cap is reached, the complete permitted Markdown is saved as `page.md` under a newly created temporary directory; the tool result reports its path.
 - URLs with credentials, non-HTTP(S) protocols, local/single-label names, and obvious local/private/reserved IP literals are rejected. IPv4-mapped IPv6 literals are also rejected.
-- markdown.new performs the primary remote fetch, including its redirects, so use only URLs you trust to disclose to that third party. Its availability, URL access rules, and conversion quality are outside this extension's control.
+- markdown.new performs the primary remote fetch, including its redirects, so use only URLs you trust to disclose to that third party. Its availability, URL access rules, and conversion quality are outside this extension's control. `$ROTATE_PROXY_URL` is treated as an HTTP(S) proxy URL and is not included in tool output.
 - GitHub's unauthenticated REST API is rate limited (typically 60 requests/hour/IP); its API route may fall back to public HTML. Respect target-site terms, robots directives, and rate limits.
 
-markdown.new documents a fair-use limit of 500 requests per IP per day. A 429 normally triggers the local fallback; if that cannot obtain useful static content, the tool returns both failure reasons.
+markdown.new documents a fair-use limit of 500 requests per IP per day. A 429 retries through `$ROTATE_PROXY_URL` when configured, then uses the local fallback; if that cannot obtain useful static content, the tool returns both failure reasons.
