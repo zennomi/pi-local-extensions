@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {
+      "source": "npm:pi-browser-harness",
+      "extensions": [
+        "-src/index.ts"
+      ],
+      "skills": [
+        "-skills/pi-browser-harness/SKILL.md"
+      ]
+    }
+  ]
+}

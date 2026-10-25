@@ -6,7 +6,8 @@
   "pi": {
     "extensions": [
       "./extensions/web-fetch/index.ts",
-      "./extensions/browser-autoconnect/index.ts"
+      "./extensions/browser-autoconnect/index.ts",
+      "./extensions/empty-response-retry/index.ts"
     ]
   },
   "description": "Personal collection of local pi extensions (web fetch, browser auto-connect, ...)",
