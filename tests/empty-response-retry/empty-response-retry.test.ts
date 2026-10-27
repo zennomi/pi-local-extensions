@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import emptyResponseRetry, {
+  CONTENT_FILTER_FALLBACK,
   FALLBACK_MODELS,
+  isContentFilterError,
   isEmptyAssistantMessage,
+  isTerminatedSubagentError,
+  isWebSocketIdleTimeoutError,
+  TERMINATED_SUBAGENT_FALLBACK,
 } from "../../extensions/empty-response-retry/index.js";
 
 const GUARD = Symbol.for("pi-local-extensions/empty-response-retry");
@@ -29,7 +34,7 @@ function setup(options: { availableFallbacks?: string[] } = {}) {
   let currentModel: Model = { provider: "cliproxyapi", id: "original" };
   const modelMap = new Map<string, Model>([
     ["cliproxyapi/original", currentModel],
-    ...FALLBACK_MODELS
+    ...[...FALLBACK_MODELS, TERMINATED_SUBAGENT_FALLBACK]
       .filter(({ id }) => options.availableFallbacks?.includes(id) ?? true)
       .map(({ provider, id }) => [
         `${provider}/${id}`,
@@ -127,10 +132,163 @@ describe("isEmptyAssistantMessage", () => {
   });
 });
 
+describe("terminated subagent errors", () => {
+  it("recognizes a terminated subagent session error", () => {
+    expect(
+      isTerminatedSubagentError(
+        message({
+          stopReason: "error",
+          errorMessage:
+            "~/.pi/agent/sessions/--Users-tuananhnguyendang-Me-cypherman--/2026-10-25T17 (subagent_done terminated)",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognizes the subagent_done tool terminating with an error", () => {
+    expect(
+      isTerminatedSubagentError(
+        message({
+          content: [{ type: "toolCall", id: "done-1", name: "subagent_done", arguments: {} }],
+          stopReason: "error",
+          errorMessage: "terminated",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognizes a WebSocket idle timeout error", () => {
+    expect(
+      isWebSocketIdleTimeoutError(
+        message({
+          stopReason: "error",
+          errorMessage: "WebSocket idle timeout after 300000ms",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognizes a content filter error", () => {
+    expect(
+      isContentFilterError(
+        message({
+          stopReason: "error",
+          errorMessage: "Response incomplete: content_filter",
+          rawStopReason: "incomplete.content_filter",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not classify unrelated errors as terminated subagent errors", () => {
+    expect(
+      isTerminatedSubagentError(
+        message({ stopReason: "error", errorMessage: "provider request failed" }),
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("empty response retry extension", () => {
   beforeEach(() => {
     delete (globalThis as Record<PropertyKey, unknown>)[GUARD];
     delete process.env.PI_EMPTY_RETRY_SIMULATE;
+  });
+
+  it("switches to Opus for a terminated subagent session error", async () => {
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    const result = (await handler(
+      turn(
+        message({
+          stopReason: "error",
+          errorMessage:
+            "~/.pi/agent/sessions/--Users-tuananhnguyendang-Me-cypherman--/2026-10-25T17 (subagent_done terminated)",
+        }),
+        "terminated",
+      ),
+      runtime.ctx,
+    )) as any;
+
+    expect(result).toMatchObject({ continue: true });
+    expect(result.entries).toEqual([
+      { type: "context_edit", targetId: "terminated", replacement: null },
+    ]);
+    expect(runtime.currentModel.id).toBe("claude-opus-5-5");
+    expect(runtime.notifications.at(-1)?.message).toContain("cliproxyapi/claude-opus-5-5");
+  });
+
+  it("switches to Opus for a WebSocket idle timeout", async () => {
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    const result = (await handler(
+      turn(
+        message({
+          stopReason: "error",
+          errorMessage: "WebSocket idle timeout after 300000ms",
+        }),
+        "websocket-timeout",
+      ),
+      runtime.ctx,
+    )) as any;
+
+    expect(result).toMatchObject({ continue: true });
+    expect(result.entries).toEqual([
+      { type: "context_edit", targetId: "websocket-timeout", replacement: null },
+    ]);
+    expect(runtime.currentModel.id).toBe("claude-opus-5-5");
+    expect(runtime.notifications.at(-1)?.message).toContain("WebSocket idle timeout");
+  });
+
+  it("switches from Opus to Gemini for any subsequent error", async () => {
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    await handler(
+      turn(
+        message({
+          stopReason: "error",
+          errorMessage: "WebSocket idle timeout after 300000ms",
+        }),
+        "timeout",
+      ),
+      runtime.ctx,
+    );
+
+    const result = (await handler(
+      turn(
+        message({
+          model: TERMINATED_SUBAGENT_FALLBACK.id,
+          stopReason: "error",
+          errorMessage: "provider request failed",
+        }),
+        "opus-error",
+      ),
+      runtime.ctx,
+    )) as any;
+
+    expect(result).toMatchObject({ continue: true });
+    expect(runtime.currentModel.id).toBe(CONTENT_FILTER_FALLBACK.id);
+    expect(runtime.setModelCalls.map(({ id }) => id)).toEqual([
+      TERMINATED_SUBAGENT_FALLBACK.id,
+      CONTENT_FILTER_FALLBACK.id,
+    ]);
+  });
+
+  it("keeps ordinary errors out of the retry flow", async () => {
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    const result = await handler(
+      turn(message({ stopReason: "error", errorMessage: "provider request failed" })),
+      runtime.ctx,
+    );
+
+    expect(result).toBeUndefined();
+    expect(runtime.currentModel.id).toBe("original");
+    expect(runtime.setModelCalls).toHaveLength(0);
   });
 
   it("retries once, then switches to Gemini and Sonnet, then gives up", async () => {

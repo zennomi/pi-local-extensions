@@ -8,9 +8,16 @@ Tự động xử lý assistant final response rỗng:
    - `cliproxyapi/claude-sonnet-5-5`
 3. Mỗi fallback chỉ thử một lần. Nếu tất cả vẫn rỗng, dừng và hiển thị cảnh báo.
 
+Nếu gặp lỗi terminated subagent có dạng đường dẫn session `.pi/agent/sessions/...` kèm
+`subagent_done terminated`, tool call `subagent_done` kết thúc với `errorMessage: "terminated"`,
+hoặc lỗi `WebSocket idle timeout after <ms>`, extension bỏ qua chuỗi retry rỗng và chuyển ngay sang
+`cliproxyapi/claude-opus-5-5`. Nếu Opus vẫn trả về bất kỳ lỗi nào, extension tiếp tục chuyển sang
+`cliproxyapi/gemini-3.8-flash-high`; `Response incomplete: content_filter` và
+`rawStopReason: "incomplete.content_filter"` chỉ là một trường hợp cụ thể.
+
 Response được xem là rỗng khi có `stopReason: "stop"`, không có tool call và không có text khác
-whitespace. Response chỉ có thinking cũng được xem là rỗng. Error, abort và length không bị retry bởi
-extension này.
+whitespace. Response chỉ có thinking cũng được xem là rỗng. Các lỗi khác, abort và length không bị
+retry bởi extension này.
 
 Sau khi run settle, extension khôi phục model ban đầu nếu người dùng chưa tự đổi model. Không thay đổi
 model mặc định của các session mới.

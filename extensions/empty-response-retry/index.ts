@@ -6,6 +6,16 @@ export const FALLBACK_MODELS = [
   { provider: "cliproxyapi", id: "claude-sonnet-5-5" },
 ] as const;
 
+export const TERMINATED_SUBAGENT_FALLBACK = {
+  provider: "cliproxyapi",
+  id: "claude-opus-5-5",
+} as const;
+
+export const CONTENT_FILTER_FALLBACK = {
+  provider: "cliproxyapi",
+  id: "gemini-3.8-flash-high",
+} as const;
+
 const EXTENSION_GUARD = Symbol.for("pi-local-extensions/empty-response-retry");
 const SIMULATION_ENV = "PI_EMPTY_RETRY_SIMULATE";
 
@@ -38,6 +48,46 @@ export function isEmptyAssistantMessage(message: AssistantMessage): boolean {
   return !message.content.some((block) => block.type === "text" && block.text.trim().length > 0);
 }
 
+export function isTerminatedSubagentError(message: AssistantMessage): boolean {
+  if (message.role !== "assistant" || message.stopReason !== "error") return false;
+
+  const errorText = [
+    message.errorMessage ?? "",
+    ...message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])),
+  ].join("\n");
+  const hasSessionPath = /\.pi\/(?:agent\/)?sessions\//i.test(errorText);
+  const hasTerminationMarker =
+    /\bsubagent_done\b[\s\S]*\bterminated\b/i.test(errorText) ||
+    /\bterminated\b[\s\S]*\bsubagent_done\b/i.test(errorText);
+  const hasSubagentDoneToolCall = message.content.some(
+    (block) => block.type === "toolCall" && block.name === "subagent_done",
+  );
+  const hasTerminatedErrorMessage = /\bterminated\b/i.test(message.errorMessage ?? "");
+
+  return (
+    (hasSessionPath && hasTerminationMarker) ||
+    (hasSubagentDoneToolCall && hasTerminatedErrorMessage)
+  );
+}
+
+export function isWebSocketIdleTimeoutError(message: AssistantMessage): boolean {
+  if (message.role !== "assistant" || message.stopReason !== "error") return false;
+
+  const diagnosticText = message.diagnostics ? JSON.stringify(message.diagnostics) : "";
+  return /\bWebSocket idle timeout after \d+ms\b/i.test(
+    `${message.errorMessage ?? ""}\n${diagnosticText}`,
+  );
+}
+
+export function isContentFilterError(message: AssistantMessage): boolean {
+  if (message.role !== "assistant" || message.stopReason !== "error") return false;
+
+  return (
+    /\bResponse incomplete:\s*content_filter\b/i.test(message.errorMessage ?? "") ||
+    message.rawStopReason === "incomplete.content_filter"
+  );
+}
+
 function resetAttempts(state: RetryState): void {
   state.emptyAttempts = 0;
   state.triedFallbacks.clear();
@@ -61,18 +111,59 @@ export default function emptyResponseRetry(pi: ExtensionAPI): void {
     if (simulated) state.simulatedResponses += 1;
 
     if (message.role !== "assistant") return;
-    if (!simulated && !isEmptyAssistantMessage(message)) {
-      resetAttempts(state);
-      return;
-    }
-
+    const terminatedSubagentError = !simulated && isTerminatedSubagentError(message);
+    const webSocketIdleTimeoutError = !simulated && isWebSocketIdleTimeoutError(message);
     const currentModel: ModelRef = {
       provider: message.provider,
       id: message.model,
     };
+    const opusKey = modelKey(TERMINATED_SUBAGENT_FALLBACK);
+    const afterOpus =
+      modelKey(currentModel) === opusKey ||
+      state.extensionModel !== undefined && modelKey(state.extensionModel) === opusKey;
+    const shouldFallbackToOpus = terminatedSubagentError || webSocketIdleTimeoutError;
+    const shouldFallbackToGemini = message.stopReason === "error" && afterOpus;
+    if (
+      !simulated &&
+      !isEmptyAssistantMessage(message) &&
+      !shouldFallbackToOpus &&
+      !shouldFallbackToGemini
+    ) {
+      resetAttempts(state);
+      return;
+    }
 
     if (state.emptyAttempts === 0 && !state.originalModel) {
       state.originalModel = ctx.model;
+    }
+
+    if (shouldFallbackToOpus || shouldFallbackToGemini) {
+      const fallback = shouldFallbackToGemini
+        ? CONTENT_FILTER_FALLBACK
+        : TERMINATED_SUBAGENT_FALLBACK;
+      const fallbackKey = modelKey(fallback);
+      const reason = shouldFallbackToGemini
+        ? "Opus error"
+        : webSocketIdleTimeoutError
+          ? "WebSocket idle timeout"
+          : "Terminated subagent error";
+      if (fallbackKey !== modelKey(currentModel) && !state.triedFallbacks.has(fallbackKey)) {
+        state.triedFallbacks.add(fallbackKey);
+        const model = ctx.modelRegistry.find(fallback.provider, fallback.id);
+        if (model && await pi.setModel(model)) {
+          state.emptyAttempts += 1;
+          state.extensionModel = fallback;
+          notify(ctx, `${reason}; switching to ${fallbackKey}`, "info");
+          return {
+            entries: [{ type: "context_edit", targetId: event.messageEntryId, replacement: null }],
+            continue: true,
+          };
+        }
+      }
+
+      notify(ctx, `${reason} fallback unavailable; keeping the error`, "warning");
+      resetAttempts(state);
+      return undefined;
     }
 
     if (state.emptyAttempts === 0) {
