@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockAgent } from "undici";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../../extensions/web-fetch/index.js";
@@ -45,6 +45,11 @@ function useLocalHttp(origin: string) {
 function primaryFailure() {
   vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ error: "unavailable" }), { status: 503 }))));
 }
+
+beforeEach(() => {
+  vi.stubEnv("PI_WEB_FETCH_LIGHTPANDA", "0");
+  vi.stubEnv("ROTATE_PROXY_URL", "");
+});
 
 afterEach(async () => {
   vi.unstubAllGlobals();

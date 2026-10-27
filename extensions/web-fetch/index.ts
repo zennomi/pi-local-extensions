@@ -2,9 +2,21 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
-import { ProxyAgent, type Dispatcher } from "undici";
+import type { Dispatcher } from "undici";
+import { assessContent, type ContentQuality } from "./content-quality.js";
 import { convertLocalSource } from "./local-convert.js";
 import { fetchLocalSource } from "./local-fetch.js";
+import { fetchJina, type JinaResult } from "./jina.js";
+import { fetchLightpanda, LightpandaUnavailable, type LightpandaResult } from "./lightpanda.js";
+import {
+  ConverterError,
+  MAX_RESPONSE_BYTES,
+  TIMEOUT_MS,
+  errorMessage,
+  hasRateLimitSignal,
+  readResponseText,
+  withProxyRetry,
+} from "./converter-utils.js";
 import { validateUrl } from "./url-safety.js";
 export { validateUrl } from "./url-safety.js";
 import {
@@ -17,8 +29,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const MARKDOWN_NEW_URL = "https://markdown.new/";
-const TIMEOUT_MS = 30_000;
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const FetchWebMdParams = Type.Object({
   url: Type.String({
     description: "Public http(s) URL to convert to clean Markdown",
@@ -48,11 +58,38 @@ interface MarkdownNewResponse {
   duration_ms?: unknown;
 }
 
+type ProviderName = "markdown.new" | "jina" | "local" | "lightpanda";
+
+interface ProviderResult {
+  markdown: string;
+  sourceUrl: string;
+  title?: string;
+  conversionMethod?: string;
+  warnings: string[];
+  partial?: boolean;
+  targetStatus?: number;
+  usedProxy?: boolean;
+  durationMs?: number;
+  markdownTokens?: string;
+  rateLimitRemaining?: string;
+}
+
+interface ProviderAttempt {
+  provider: ProviderName;
+  usedProxy?: boolean;
+  ok: boolean;
+  thin?: boolean;
+  blocked?: boolean;
+  textChars?: number;
+  error?: string;
+}
+
 interface FetchWebMdDetails {
   requestedUrl: string;
   sourceUrl: string;
   title?: string;
   method: ConversionMethod;
+  provider: ProviderName;
   conversionMethod?: string;
   durationMs?: number;
   markdownTokens?: string;
@@ -62,6 +99,7 @@ interface FetchWebMdDetails {
   primaryError?: string;
   warnings?: string[];
   partial?: boolean;
+  attempts: ProviderAttempt[];
   truncation?: ReturnType<typeof truncateHead>;
   fullOutputPath?: string;
 }
@@ -70,35 +108,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-class MarkdownNewError extends Error {
+class MarkdownNewError extends ConverterError {
   constructor(
     message: string,
-    readonly status: number,
+    status: number,
     readonly rateLimited: boolean,
   ) {
-    super(message);
+    super(message, "markdown.new", status, rateLimited || status === 403);
     this.name = "MarkdownNewError";
-  }
-}
-
-function hasRateLimitSignal(value: string | undefined): boolean {
-  return value !== undefined && /rate[ -]?limit|too many requests|throttl|quota|request limit/i.test(value);
-}
-
-function rotateProxyUrl(): string | undefined {
-  const value = process.env.ROTATE_PROXY_URL?.trim();
-  if (!value) return undefined;
-
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
-    return url.toString();
-  } catch {
-    return undefined;
   }
 }
 
@@ -120,40 +137,6 @@ function responseSizeError(): Error {
   );
 }
 
-async function readResponseText(response: Response): Promise<string> {
-  const contentLength = response.headers.get("content-length");
-  if (contentLength !== null) {
-    const declaredLength = Number(contentLength);
-    if (Number.isSafeInteger(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
-      throw responseSizeError();
-    }
-  }
-
-  if (!response.body) return "";
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  let receivedBytes = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      receivedBytes += value.byteLength;
-      if (receivedBytes > MAX_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined);
-        throw responseSizeError();
-      }
-      chunks.push(decoder.decode(value, { stream: true }));
-    }
-    chunks.push(decoder.decode());
-    return chunks.join("");
-  } finally {
-    reader.releaseLock();
-  }
-}
 
 function parsePayload(raw: string, response: Response): MarkdownNewResponse | undefined {
   try {
@@ -218,7 +201,7 @@ async function convertToMarkdown(
     if (dispatcher) request.dispatcher = dispatcher;
 
     const response = await fetch(MARKDOWN_NEW_URL, request);
-    const raw = await readResponseText(response);
+    const raw = await readResponseText(response, MAX_RESPONSE_BYTES, responseSizeError);
     const payload = parsePayload(raw, response);
 
     if (!response.ok || payload?.success !== true) {
@@ -235,7 +218,15 @@ async function convertToMarkdown(
     if (signal?.aborted) {
       throw new Error("markdown.new request was aborted.", { cause: error });
     }
-    throw error;
+    if (errorMessage(error).includes("response exceeds the")) throw error;
+    if (error instanceof ConverterError) throw error;
+    throw new ConverterError(
+      `markdown.new request failed: ${errorMessage(error)}`,
+      "markdown.new",
+      0,
+      true,
+      { cause: error },
+    );
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abortFromParent);
@@ -246,39 +237,12 @@ async function convertToMarkdownWithProxyFallback(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ payload: MarkdownNewResponse; response: Response; usedProxy?: boolean }> {
-  try {
-    return await convertToMarkdown(body, signal);
-  } catch (primaryError) {
-    if (!(primaryError instanceof MarkdownNewError) || !primaryError.rateLimited || signal?.aborted) {
-      throw primaryError;
-    }
-
-    const proxyUrl = rotateProxyUrl();
-    if (!proxyUrl) throw primaryError;
-
-    let proxy: ProxyAgent;
-    try {
-      proxy = new ProxyAgent(proxyUrl);
-    } catch (proxyError) {
-      throw new Error(
-        `${errorMessage(primaryError)} Proxy fallback is unavailable because ROTATE_PROXY_URL is invalid.`,
-        { cause: proxyError },
-      );
-    }
-
-    try {
-      const result = await convertToMarkdown(body, signal, proxy);
-      return { ...result, usedProxy: true };
-    } catch (proxyError) {
-      if (signal?.aborted) throw proxyError;
-      throw new Error(
-        `${errorMessage(primaryError)} Proxy retry via ROTATE_PROXY_URL failed: ${errorMessage(proxyError)}`,
-        { cause: proxyError },
-      );
-    } finally {
-      await proxy.close().catch(() => undefined);
-    }
-  }
+  const { value, usedProxy } = await withProxyRetry(
+    "markdown.new",
+    (dispatcher) => convertToMarkdown(body, signal, dispatcher),
+    signal,
+  );
+  return { ...value, usedProxy };
 }
 
 async function saveFullOutput(content: string): Promise<string> {
@@ -288,85 +252,204 @@ async function saveFullOutput(content: string): Promise<string> {
   return fullOutputPath;
 }
 
+interface Candidate {
+  provider: ProviderName;
+  result: ProviderResult;
+  quality: ContentQuality;
+}
+
+function candidateIsBetter(next: Candidate, current: Candidate | undefined): boolean {
+  if (!current) return true;
+  if (next.quality.blocked !== current.quality.blocked) return !next.quality.blocked;
+  return next.quality.textChars > current.quality.textChars;
+}
+
+function markdownResult(
+  payload: MarkdownNewResponse,
+  response: Response,
+  usedProxy?: boolean,
+): ProviderResult {
+  if (typeof payload.content !== "string" || payload.content.length === 0) {
+    throw new Error("markdown.new returned no Markdown content.");
+  }
+  return {
+    markdown: payload.content,
+    sourceUrl: typeof payload.url === "string" ? payload.url : "",
+    title: typeof payload.title === "string" ? payload.title : undefined,
+    conversionMethod: typeof payload.method === "string" ? payload.method : undefined,
+    durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : undefined,
+    markdownTokens: response.headers.get("x-markdown-tokens") ?? undefined,
+    rateLimitRemaining:
+      response.headers.get("x-rate-limit-remaining") ??
+      response.headers.get("x-ratelimit-remaining") ??
+      undefined,
+    warnings: [],
+    usedProxy,
+  };
+}
+
+function jinaResult(value: JinaResult): ProviderResult {
+  return value;
+}
+
+function lightpandaResult(value: LightpandaResult): ProviderResult {
+  return value;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "fetch_web_md",
     label: "Fetch Web Markdown",
     description:
-      `Convert a public web URL to clean Markdown via markdown.new, retrying rate-limited requests through $ROTATE_PROXY_URL when configured, then using a bounded static local fallback. JavaScript-rendered pages may be incomplete; use browser_* tools when advised. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
-    promptSnippet: "Fetch a public web page as clean Markdown with markdown.new and static fallback",
+      `Convert a public web URL to clean Markdown via markdown.new, Jina, a bounded static fallback, and Lightpanda for client-rendered pages. Rate-limited converter requests retry through $ROTATE_PROXY_URL when configured. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the complete result is saved to a temporary file when truncated.`,
+    promptSnippet: "Fetch a public web page as Markdown with converter, static, and Lightpanda fallbacks",
     promptGuidelines: [
       "Use fetch_web_md to read or research a public web page when its Markdown content is needed.",
-      "When this tool marks a result incomplete and browser_* tools are available, use browser tools for the rendered page.",
+      "When this tool marks a result incomplete and browser_* tools are available, use browser tools to render and inspect the page.",
     ],
     parameters: FetchWebMdParams,
 
     async execute(_toolCallId, params, signal) {
       const url = validateUrl(params.url);
       const method = (params.method ?? "auto") as ConversionMethod;
-      let markdown: string;
-      let details: FetchWebMdDetails;
-      try {
+      const retainImages = params.retain_images ?? false;
+      const attempts: ProviderAttempt[] = [];
+      const errors: string[] = [];
+      const providerWarnings: string[] = [];
+      let candidate: Candidate | undefined;
+      let markdown = "";
+      let selected: Candidate | undefined;
+      let incompleteWarning: string | undefined;
+
+      const markdownProvider = async (): Promise<ProviderResult> => {
         const { payload, response, usedProxy } = await convertToMarkdownWithProxyFallback(
-          {
-            url,
-            method,
-            retain_images: params.retain_images ?? false,
-          },
+          { url, method, retain_images: retainImages },
           signal,
         );
-        if (typeof payload.content !== "string" || payload.content.length === 0) {
-          throw new Error("markdown.new returned no Markdown content.");
+        const result = markdownResult(payload, response, usedProxy);
+        if (!result.sourceUrl) result.sourceUrl = url;
+        return result;
+      };
+      const jinaProvider = async (): Promise<ProviderResult> => jinaResult(await fetchJina(url, retainImages, signal));
+      const localProvider = async (): Promise<ProviderResult> => {
+        const source = await fetchLocalSource(url, { signal, retainImages });
+        const local = convertLocalSource(source, retainImages);
+        const warnings = [...local.warnings];
+        if (method === "browser") {
+          warnings.push("The local fallback cannot execute JavaScript, despite method: browser.");
         }
-        markdown = payload.content;
-        details = {
-          requestedUrl: url,
-          sourceUrl: typeof payload.url === "string" ? payload.url : url,
-          title: typeof payload.title === "string" ? payload.title : undefined,
-          method,
-          conversionMethod: typeof payload.method === "string" ? payload.method : undefined,
-          durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : undefined,
-          markdownTokens: response.headers.get("x-markdown-tokens") ?? undefined,
-          rateLimitRemaining: response.headers.get("x-rate-limit-remaining") ?? undefined,
-          usedProxy,
-        };
-      } catch (primaryError) {
-        if (!shouldUseLocalFallback(primaryError, signal)) throw primaryError;
-        try {
-          const source = await fetchLocalSource(url, {
-            signal,
-            retainImages: params.retain_images ?? false,
-          });
-          const local = convertLocalSource(source, params.retain_images ?? false);
-          const warnings = [...local.warnings];
-          if (method === "browser") {
-            warnings.push("The local fallback cannot execute JavaScript, despite method: browser.");
-          }
-          if (local.partial) {
-            warnings.push(browserAdvice(pi) ?? "Static extraction may be incomplete because this page needs client-side rendering.");
-          }
-          markdown = local.content;
-          if (warnings.length > 0) {
-            markdown += `\n> **${local.partial ? "Incomplete static fallback" : "Fallback note"}:** ${warnings.join(" ")}\n`;
-          }
-          details = {
-            requestedUrl: url,
-            sourceUrl: local.sourceUrl,
-            title: local.title,
-            method,
-            conversionMethod: local.conversionMethod,
-            fallback: true,
-            primaryError: errorMessage(primaryError),
-            warnings,
-            partial: local.partial,
-          };
-        } catch (fallbackError) {
-          const advice = browserAdvice(pi);
-          throw new Error(
-            `${errorMessage(primaryError)} Local fallback failed: ${errorMessage(fallbackError)}${advice ? ` ${advice}` : ""}`,
-            { cause: fallbackError },
+        if (local.partial) {
+          warnings.push(
+            browserAdvice(pi) ??
+              "Static extraction may be incomplete because this page needs client-side rendering.",
           );
         }
+        let content = local.content;
+        if (warnings.length > 0) {
+          content += `\n> **${local.partial ? "Incomplete static fallback" : "Fallback note"}:** ${warnings.join(" ")}\n`;
+        }
+        return {
+          markdown: content,
+          sourceUrl: local.sourceUrl,
+          title: local.title,
+          conversionMethod: local.conversionMethod,
+          warnings,
+          partial: local.partial,
+        };
+      };
+      const lightpandaProvider = async (): Promise<ProviderResult> =>
+        lightpandaResult(await fetchLightpanda(url, retainImages, signal));
+
+      const providers: Array<[ProviderName, () => Promise<ProviderResult>]> =
+        method === "browser"
+          ? [
+              ["markdown.new", markdownProvider],
+              ["lightpanda", lightpandaProvider],
+              ["jina", jinaProvider],
+              ["local", localProvider],
+            ]
+          : [
+              ["markdown.new", markdownProvider],
+              ["jina", jinaProvider],
+              ["local", localProvider],
+              ["lightpanda", lightpandaProvider],
+            ];
+
+      for (const [provider, fetchProvider] of providers) {
+        if (signal?.aborted) throw new Error("fetch_web_md request was aborted.", { cause: signal.reason });
+        try {
+          const result = await fetchProvider();
+          const quality = assessContent(result.markdown, {
+            partial: result.partial,
+            targetStatus: result.targetStatus,
+          });
+          const attempt: ProviderAttempt = {
+            provider,
+            usedProxy: result.usedProxy,
+            ok: true,
+            thin: quality.thin,
+            blocked: quality.blocked,
+            textChars: quality.textChars,
+          };
+          attempts.push(attempt);
+          const nextCandidate = { provider, result, quality };
+          if (candidateIsBetter(nextCandidate, candidate)) candidate = nextCandidate;
+          if (!quality.thin && !quality.blocked) {
+            selected = nextCandidate;
+            break;
+          }
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          const message = errorMessage(error);
+          attempts.push({ provider, ok: false, error: message });
+          errors.push(message);
+          if (error instanceof LightpandaUnavailable) providerWarnings.push(message);
+          if (provider === "markdown.new" && !shouldUseLocalFallback(error, signal)) throw error;
+        }
+      }
+
+      selected ??= candidate;
+      if (!selected) {
+        const advice = browserAdvice(pi);
+        const primary = errors[0] ?? "All web Markdown providers failed.";
+        const rest = errors.slice(1);
+        throw new Error(
+          `${primary}${rest.length > 0 ? ` Fallback attempts failed: ${rest.join(" | ")}` : ""}${advice ? ` ${advice}` : ""}`,
+        );
+      }
+
+      markdown = selected.result.markdown;
+      const selectedQuality = selected.quality;
+      const warnings = [...providerWarnings, ...selected.result.warnings];
+      if (selectedQuality.thin || selectedQuality.blocked) {
+        incompleteWarning =
+          `All available converters returned thin or blocked content; selected the best available ${selected.provider} result (${selectedQuality.textChars} meaningful characters).`;
+        warnings.push(incompleteWarning);
+        const advice = browserAdvice(pi);
+        if (advice) warnings.push(advice);
+        markdown += `\n> **Incomplete fetch:** ${warnings.join(" ")}\n`;
+      }
+
+      const firstError = errors[0];
+      const details: FetchWebMdDetails = {
+        requestedUrl: url,
+        sourceUrl: selected.result.sourceUrl || url,
+        title: selected.result.title,
+        method,
+        provider: selected.provider,
+        conversionMethod: selected.result.conversionMethod,
+        durationMs: selected.result.durationMs,
+        markdownTokens: selected.result.markdownTokens,
+        rateLimitRemaining: selected.result.rateLimitRemaining,
+        usedProxy: selected.result.usedProxy,
+        fallback: selected.provider !== "markdown.new",
+        primaryError: firstError,
+        warnings: warnings.length > 0 ? warnings : undefined,
+        partial: Boolean(selected.result.partial || selectedQuality.thin || selectedQuality.blocked),
+        attempts,
+      };
+      if (incompleteWarning && !details.warnings?.includes(incompleteWarning)) {
+        details.warnings = [...(details.warnings ?? []), incompleteWarning];
       }
 
       const truncation = truncateHead(markdown, {

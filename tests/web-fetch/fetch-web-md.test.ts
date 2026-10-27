@@ -1,6 +1,6 @@
 import { readFile, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension, { validateUrl } from "../../extensions/web-fetch/index.js";
 
@@ -45,7 +45,9 @@ function jsonResponse(
   });
 }
 
-function successfulPayload(content = "# Example\n") {
+const DEFAULT_MARKDOWN = `# Example\n\n${"Useful content. ".repeat(40)}`;
+
+function successfulPayload(content = DEFAULT_MARKDOWN) {
   return {
     success: true,
     url: "https://example.com/final",
@@ -68,6 +70,11 @@ function abortingFetch() {
   );
 }
 
+beforeEach(() => {
+  vi.stubEnv("PI_WEB_FETCH_LIGHTPANDA", "0");
+  vi.stubEnv("ROTATE_PROXY_URL", "");
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -81,10 +88,10 @@ describe("fetch_web_md extension", () => {
     expect(tool).toMatchObject({
       name: "fetch_web_md",
       label: "Fetch Web Markdown",
-      promptSnippet: "Fetch a public web page as clean Markdown with markdown.new and static fallback",
+      promptSnippet: "Fetch a public web page as Markdown with converter, static, and Lightpanda fallbacks",
       promptGuidelines: [
         "Use fetch_web_md to read or research a public web page when its Markdown content is needed.",
-        "When this tool marks a result incomplete and browser_* tools are available, use browser tools for the rendered page.",
+        "When this tool marks a result incomplete and browser_* tools are available, use browser tools to render and inspect the page.",
       ],
     });
     expect(tool.description).toContain("Output is truncated");
@@ -116,7 +123,7 @@ describe("fetch_web_md extension", () => {
       method: "auto",
       retain_images: false,
     });
-    expect(result.content).toEqual([{ type: "text", text: "# Example\n" }]);
+    expect(result.content).toEqual([{ type: "text", text: DEFAULT_MARKDOWN }]);
     expect(result.details).toMatchObject({
       requestedUrl: "https://example.com/",
       sourceUrl: "https://example.com/final",
@@ -173,7 +180,7 @@ describe("fetch_web_md extension", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ error: "Daily limit reached" }, 429))
-      .mockResolvedValueOnce(jsonResponse(successfulPayload("# Via proxy\n")));
+      .mockResolvedValueOnce(jsonResponse(successfulPayload(`# Via proxy\n\n${"Useful content. ".repeat(40)}`)));
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await getTool().execute("call-proxy", { url: "https://example.com" });
@@ -181,7 +188,7 @@ describe("fetch_web_md extension", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const [, proxyRequest] = (fetchMock.mock.calls as unknown as [string, RequestInit][]) [1]!;
     expect((proxyRequest as RequestInit & { dispatcher?: unknown }).dispatcher).toBeDefined();
-    expect(result.content).toEqual([{ type: "text", text: "# Via proxy\n" }]);
+    expect(result.content).toEqual([{ type: "text", text: `# Via proxy\n\n${"Useful content. ".repeat(40)}` }]);
     expect(result.details).toMatchObject({ usedProxy: true });
   });
 
@@ -191,19 +198,19 @@ describe("fetch_web_md extension", () => {
       vi.fn(() => Promise.resolve(jsonResponse({ error: "Daily limit reached" }, 429))),
     );
 
-    await expect(getTool().execute("call-1", { url: "https://example.com" })).rejects.toThrow(
+    await expect(getTool().execute("call-1", { url: "https://does-not-exist.invalid/" })).rejects.toThrow(
       "markdown.new conversion failed (429): Daily limit reached",
     );
   });
 
   it("rejects malformed JSON and malformed successful payloads", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("not json"))));
-    await expect(getTool().execute("call-1", { url: "https://example.com" })).rejects.toThrow(
+    await expect(getTool().execute("call-1", { url: "https://does-not-exist.invalid/" })).rejects.toThrow(
       "invalid JSON response",
     );
 
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse([]))));
-    await expect(getTool().execute("call-2", { url: "https://example.com" })).rejects.toThrow(
+    await expect(getTool().execute("call-2", { url: "https://does-not-exist.invalid/" })).rejects.toThrow(
       "markdown.new conversion failed (200)",
     );
   });
@@ -211,24 +218,20 @@ describe("fetch_web_md extension", () => {
   it("reports a missing Markdown field", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse({ success: true }))));
 
-    await expect(getTool().execute("call-1", { url: "https://example.com" })).rejects.toThrow(
+    await expect(getTool().execute("call-1", { url: "https://does-not-exist.invalid/" })).rejects.toThrow(
       "returned no Markdown content",
     );
   });
 
-  it("distinguishes timeout from caller cancellation", async () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("fetch", abortingFetch());
-
-    const timeout = getTool().execute("call-timeout", { url: "https://example.com" });
-    const timeoutExpectation = expect(timeout).rejects.toThrow("timed out after 30s");
-    await vi.advanceTimersByTimeAsync(30_000);
-    await timeoutExpectation;
-
+  it("stops the provider chain on caller cancellation", async () => {
+    const fetchMock = abortingFetch();
+    vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
-    const aborted = getTool().execute("call-abort", { url: "https://example.com" }, controller.signal);
+    const aborted = getTool().execute("call-abort", { url: "https://does-not-exist.invalid/" }, controller.signal);
     controller.abort("caller stopped the request");
+
     await expect(aborted).rejects.toThrow("request was aborted");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("rejects oversized declared and chunked responses", async () => {

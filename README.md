@@ -6,7 +6,7 @@ independent and can be loaded or disabled separately.
 
 | Extension | Entry point | Purpose |
 |---|---|---|
-| [web-fetch](./extensions/web-fetch/README.md) | `extensions/web-fetch/index.ts` | `fetch_web_md` tool: web page → Markdown via markdown.new, proxy retry, and static fallback |
+| [web-fetch](./extensions/web-fetch/README.md) | `extensions/web-fetch/index.ts` | `fetch_web_md` tool: web page → Markdown via markdown.new, Jina, static fallback, and Lightpanda |
 | [browser-autoconnect](./extensions/browser-autoconnect/README.md) | `extensions/browser-autoconnect/index.ts` | Runs `/browser-setup` at interactive startup when `pi-browser-harness` is enabled |
 | [empty-response-retry](./extensions/empty-response-retry/README.md) | `extensions/empty-response-retry/index.ts` | Retries empty final responses, then tries Gemini and Claude fallbacks |
 
@@ -74,7 +74,6 @@ This project is intentionally private and local-only. It does not build or publi
 pnpm check
 ```
 
-`pnpm check` runs TypeScript typechecking and the Vitest suite. Tests mock `fetch`; they do not call
-markdown.new or any other remote service.
+`pnpm check` runs TypeScript typechecking and the Vitest suite. Tests mock remote converters and Lightpanda; they do not call markdown.new, Jina, or any other remote service.
 
 To reload changes in an interactive Pi session, use `/reload`.
