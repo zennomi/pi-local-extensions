@@ -1,12 +1,17 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import emptyResponseRetry, {
   CONTENT_FILTER_FALLBACK,
   FALLBACK_MODELS,
   isContentFilterError,
   isEmptyAssistantMessage,
+  isSubagentSession,
   isTerminatedSubagentError,
   isWebSocketIdleTimeoutError,
+  hasFinalAnswerForSubagentDone,
+  MAX_SUBAGENT_DONE_BLOCKS,
+  SUBAGENT_DONE_BLOCK_REASON,
+  SUBAGENT_ENV,
   TERMINATED_SUBAGENT_FALLBACK,
 } from "../../extensions/empty-response-retry/index.js";
 
@@ -104,6 +109,26 @@ function turn(messageValue: AssistantMessage, messageEntryId = "assistant-entry"
   };
 }
 
+describe("isSubagentSession", () => {
+  it.each([
+    [undefined, false],
+    ["", false],
+    [" \n\t", false],
+    ["test-subagent", true],
+    [" test-subagent \n", true],
+  ])("returns %s → %s", (id, expected) => {
+    expect(isSubagentSession({ [SUBAGENT_ENV]: id })).toBe(expected);
+  });
+
+  it("ignores other subagent metadata without an id", () => {
+    expect(isSubagentSession({
+      PI_SUBAGENT_SESSION: "/tmp/child.jsonl",
+      PI_SUBAGENT_NAME: "child",
+      PI_SUBAGENT_AUTO_EXIT: "1",
+    })).toBe(false);
+  });
+});
+
 describe("isEmptyAssistantMessage", () => {
   it.each([
     ["empty content", []],
@@ -190,12 +215,26 @@ describe("terminated subagent errors", () => {
 });
 
 describe("empty response retry extension", () => {
+  let originalSubagentId: string | undefined;
+  let originalSimulation: string | undefined;
+
   beforeEach(() => {
+    originalSubagentId = process.env.PI_SUBAGENT_ID;
+    originalSimulation = process.env.PI_EMPTY_RETRY_SIMULATE;
+    process.env.PI_SUBAGENT_ID = "test-subagent";
     delete (globalThis as Record<PropertyKey, unknown>)[GUARD];
     delete process.env.PI_EMPTY_RETRY_SIMULATE;
   });
 
-  it("switches to Opus for a terminated subagent session error", async () => {
+  afterEach(() => {
+    if (originalSubagentId === undefined) delete process.env.PI_SUBAGENT_ID;
+    else process.env.PI_SUBAGENT_ID = originalSubagentId;
+    if (originalSimulation === undefined) delete process.env.PI_EMPTY_RETRY_SIMULATE;
+    else process.env.PI_EMPTY_RETRY_SIMULATE = originalSimulation;
+  });
+
+  it.each(["subagent", "main"])("switches to Opus for a terminated subagent error in %s sessions", async (session) => {
+    if (session === "main") delete process.env.PI_SUBAGENT_ID;
     const runtime = setup();
     const handler = runtime.handlers.get("turn_end")!;
 
@@ -219,7 +258,8 @@ describe("empty response retry extension", () => {
     expect(runtime.notifications.at(-1)?.message).toContain("cliproxyapi/claude-opus-5-5");
   });
 
-  it("switches to Opus for a WebSocket idle timeout", async () => {
+  it.each(["subagent", "main"])("switches to Opus for a WebSocket idle timeout in %s sessions", async (session) => {
+    if (session === "main") delete process.env.PI_SUBAGENT_ID;
     const runtime = setup();
     const handler = runtime.handlers.get("turn_end")!;
 
@@ -242,7 +282,8 @@ describe("empty response retry extension", () => {
     expect(runtime.notifications.at(-1)?.message).toContain("WebSocket idle timeout");
   });
 
-  it("switches from Opus to Gemini for any subsequent error", async () => {
+  it.each(["subagent", "main"])("switches from Opus to Gemini for any subsequent error in %s sessions", async (session) => {
+    if (session === "main") delete process.env.PI_SUBAGENT_ID;
     const runtime = setup();
     const handler = runtime.handlers.get("turn_end")!;
 
@@ -275,6 +316,64 @@ describe("empty response retry extension", () => {
       TERMINATED_SUBAGENT_FALLBACK.id,
       CONTENT_FILTER_FALLBACK.id,
     ]);
+  });
+
+  it.each([
+    ["empty content", []],
+    ["whitespace text", [{ type: "text", text: " \n\t" }]],
+    ["thinking only", [{ type: "thinking", thinking: "internal reasoning" }]],
+  ])("does not retry %s in main sessions", async (_name, content) => {
+    delete process.env.PI_SUBAGENT_ID;
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    for (let i = 0; i < 4; i++) {
+      expect(await handler(turn(message({ content: content as never })), runtime.ctx)).toBeUndefined();
+    }
+
+    expect(runtime.currentModel.id).toBe("original");
+    expect(runtime.setModelCalls).toHaveLength(0);
+    expect(runtime.notifications).toHaveLength(0);
+  });
+
+  it("ignores simulation in main sessions", async () => {
+    delete process.env.PI_SUBAGENT_ID;
+    process.env.PI_EMPTY_RETRY_SIMULATE = "1";
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    const result = await handler(
+      turn(message({ content: [{ type: "text", text: "visible answer" }] })),
+      runtime.ctx,
+    );
+
+    expect(result).toBeUndefined();
+    expect(runtime.currentModel.id).toBe("original");
+    expect(runtime.setModelCalls).toHaveLength(0);
+    expect(runtime.notifications).toHaveLength(0);
+  });
+
+  it("does not retry an empty response after an error fallback in main sessions and restores the model", async () => {
+    delete process.env.PI_SUBAGENT_ID;
+    const runtime = setup();
+    const handler = runtime.handlers.get("turn_end")!;
+
+    await handler(
+      turn(message({ stopReason: "error", errorMessage: "WebSocket idle timeout after 300000ms" })),
+      runtime.ctx,
+    );
+    const result = await handler(
+      turn(message({ model: TERMINATED_SUBAGENT_FALLBACK.id })),
+      runtime.ctx,
+    );
+
+    expect(result).toBeUndefined();
+    expect(runtime.setModelCalls.map(({ id }) => id)).toEqual([TERMINATED_SUBAGENT_FALLBACK.id]);
+    expect(runtime.notifications).toHaveLength(1);
+
+    await runtime.handlers.get("agent_settled")!({ type: "agent_settled", aborted: false }, runtime.ctx);
+    expect(runtime.currentModel.id).toBe("original");
+    expect(runtime.setModelCalls.map(({ id }) => id)).toEqual([TERMINATED_SUBAGENT_FALLBACK.id, "original"]);
   });
 
   it("keeps ordinary errors out of the retry flow", async () => {
@@ -395,5 +494,110 @@ describe("empty response retry extension", () => {
     )) as any;
 
     expect(result).toMatchObject({ continue: true });
+  });
+});
+
+describe("subagent_done final answer guard", () => {
+  beforeEach(() => {
+    delete (globalThis as Record<PropertyKey, unknown>)[GUARD];
+  });
+
+  const thinking = { type: "thinking", thinking: "I will answer alongside the tool call" };
+  const doneCall = { type: "toolCall", id: "done-1", name: "subagent_done", arguments: {} };
+  const readCall = { type: "toolCall", id: "read-1", name: "read", arguments: {} };
+  const text = (value: string) => ({ type: "text", text: value });
+
+  function assistant(content: unknown[]) {
+    return { type: "message_end", message: message({ content: content as never, stopReason: "toolUse" }) };
+  }
+
+  function doneEvent() {
+    return { type: "tool_call", toolCallId: "done-1", toolName: "subagent_done", input: {} };
+  }
+
+  it.each([
+    ["text in the same message", { hasText: true, hasToolCalls: true }, undefined, true],
+    ["previous plain text answer", { hasText: false, hasToolCalls: true }, { hasText: true, hasToolCalls: false }, true],
+    ["previous text that also called tools", { hasText: false, hasToolCalls: true }, { hasText: true, hasToolCalls: true }, false],
+    ["no text at all", { hasText: false, hasToolCalls: true }, { hasText: false, hasToolCalls: true }, false],
+    ["no history", undefined, undefined, false],
+  ])("hasFinalAnswerForSubagentDone: %s", (_name, current, previous, expected) => {
+    expect(hasFinalAnswerForSubagentDone(current as never, previous as never)).toBe(expected);
+  });
+
+  it("blocks subagent_done when the model only thought about the answer", async () => {
+    const runtime = setup();
+    await runtime.handlers.get("message_end")!(assistant([thinking, doneCall]), runtime.ctx);
+
+    const result = await runtime.handlers.get("tool_call")!(doneEvent(), runtime.ctx);
+
+    expect(result).toEqual({ block: true, reason: SUBAGENT_DONE_BLOCK_REASON });
+  });
+
+  it("allows subagent_done when the final text is in the same message", async () => {
+    const runtime = setup();
+    await runtime.handlers.get("message_end")!(assistant([thinking, text("1 + 1 = 2"), doneCall]), runtime.ctx);
+
+    expect(await runtime.handlers.get("tool_call")!(doneEvent(), runtime.ctx)).toBeUndefined();
+  });
+
+  it("allows subagent_done right after a plain text answer", async () => {
+    const runtime = setup();
+    const messageEnd = runtime.handlers.get("message_end")!;
+    await messageEnd({ type: "message_end", message: message({ content: [text("Result: 2")] as never }) }, runtime.ctx);
+    await messageEnd(assistant([doneCall]), runtime.ctx);
+
+    expect(await runtime.handlers.get("tool_call")!(doneEvent(), runtime.ctx)).toBeUndefined();
+  });
+
+  it("blocks when the only text was an intermediate note before tool work", async () => {
+    const runtime = setup();
+    const messageEnd = runtime.handlers.get("message_end")!;
+    await messageEnd(assistant([text("Let me check the file"), readCall]), runtime.ctx);
+    await messageEnd(assistant([doneCall]), runtime.ctx);
+
+    expect(await runtime.handlers.get("tool_call")!(doneEvent(), runtime.ctx)).toMatchObject({ block: true });
+  });
+
+  it("ignores other tools and non-assistant messages", async () => {
+    const runtime = setup();
+    await runtime.handlers.get("message_end")!(
+      { type: "message_end", message: { role: "user", content: "hi", timestamp: 0 } },
+      runtime.ctx,
+    );
+
+    expect(
+      await runtime.handlers.get("tool_call")!({ type: "tool_call", toolCallId: "r", toolName: "read", input: {} }, runtime.ctx),
+    ).toBeUndefined();
+  });
+
+  it("fails open after the maximum number of consecutive blocks", async () => {
+    const runtime = setup();
+    const messageEnd = runtime.handlers.get("message_end")!;
+    const toolCall = runtime.handlers.get("tool_call")!;
+
+    for (let i = 0; i < MAX_SUBAGENT_DONE_BLOCKS; i++) {
+      await messageEnd(assistant([thinking, doneCall]), runtime.ctx);
+      expect(await toolCall(doneEvent(), runtime.ctx)).toMatchObject({ block: true });
+    }
+    await messageEnd(assistant([thinking, doneCall]), runtime.ctx);
+
+    expect(await toolCall(doneEvent(), runtime.ctx)).toBeUndefined();
+    expect(runtime.notifications.at(-1)).toMatchObject({ level: "warning" });
+  });
+
+  it("resets the block counter after the run settles", async () => {
+    const runtime = setup();
+    const messageEnd = runtime.handlers.get("message_end")!;
+    const toolCall = runtime.handlers.get("tool_call")!;
+
+    for (let i = 0; i < MAX_SUBAGENT_DONE_BLOCKS; i++) {
+      await messageEnd(assistant([thinking, doneCall]), runtime.ctx);
+      await toolCall(doneEvent(), runtime.ctx);
+    }
+    await runtime.handlers.get("agent_settled")!({ type: "agent_settled", aborted: false }, runtime.ctx);
+    await messageEnd(assistant([thinking, doneCall]), runtime.ctx);
+
+    expect(await toolCall(doneEvent(), runtime.ctx)).toMatchObject({ block: true });
   });
 });

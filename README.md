@@ -8,7 +8,7 @@ independent and can be loaded or disabled separately.
 |---|---|---|
 | [web-fetch](./extensions/web-fetch/README.md) | `extensions/web-fetch/index.ts` | `fetch_web_md` tool: web page → Markdown via markdown.new, Jina, static fallback, and Lightpanda |
 | [browser-autoconnect](./extensions/browser-autoconnect/README.md) | `extensions/browser-autoconnect/index.ts` | Runs `/browser-setup` at interactive startup when `pi-browser-harness` is enabled |
-| [empty-response-retry](./extensions/empty-response-retry/README.md) | `extensions/empty-response-retry/index.ts` | Retries empty final responses, then tries Gemini and Claude fallbacks |
+| [empty-response-retry](./extensions/empty-response-retry/README.md) | `extensions/empty-response-retry/index.ts` | Retries empty final responses only in subagent sessions, then tries Gemini and Claude fallbacks; error fallbacks apply to all sessions |
 
 ## Layout
 

@@ -16,12 +16,27 @@ export const CONTENT_FILTER_FALLBACK = {
   id: "gemini-3.8-flash-high",
 } as const;
 
+export const SUBAGENT_ENV = "PI_SUBAGENT_ID";
+export const SUBAGENT_DONE_TOOL = "subagent_done";
+/** Consecutive blocks before failing open, so a model that never writes text cannot loop forever. */
+export const MAX_SUBAGENT_DONE_BLOCKS = 2;
+export const SUBAGENT_DONE_BLOCK_REASON =
+  "subagent_done was blocked: you have not written a visible final answer. " +
+  "Thinking/reasoning is NOT returned to the caller — only normal assistant text is. " +
+  "Write your final result/summary now as a plain text assistant message, " +
+  "then call subagent_done again (if you are still running).";
+
 const EXTENSION_GUARD = Symbol.for("pi-local-extensions/empty-response-retry");
 const SIMULATION_ENV = "PI_EMPTY_RETRY_SIMULATE";
 
 type ModelRef = { provider: string; id: string };
 
+export type AssistantSummary = { hasText: boolean; hasToolCalls: boolean };
+
 type RetryState = {
+  currentAssistant?: AssistantSummary;
+  previousAssistant?: AssistantSummary;
+  subagentDoneBlocks: number;
   emptyAttempts: number;
   triedFallbacks: Set<string>;
   originalModel?: Model<any>;
@@ -42,10 +57,34 @@ function simulationLimit(): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+export function isSubagentSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env[SUBAGENT_ENV]?.trim() ?? "").length > 0;
+}
+
 export function isEmptyAssistantMessage(message: AssistantMessage): boolean {
   if (message.role !== "assistant" || message.stopReason !== "stop") return false;
   if (message.content.some((block) => block.type === "toolCall")) return false;
   return !message.content.some((block) => block.type === "text" && block.text.trim().length > 0);
+}
+
+export function summarizeAssistant(message: AssistantMessage): AssistantSummary {
+  return {
+    hasText: message.content.some((block) => block.type === "text" && block.text.trim().length > 0),
+    hasToolCalls: message.content.some((block) => block.type === "toolCall"),
+  };
+}
+
+/**
+ * pi-herdr-subagents returns the last assistant *text* as the subagent's result. Allow
+ * `subagent_done` only when that text is the final answer: written in the same message as the
+ * call, or in the previous message when that message was a plain text answer (no tool calls).
+ */
+export function hasFinalAnswerForSubagentDone(
+  current: AssistantSummary | undefined,
+  previous: AssistantSummary | undefined,
+): boolean {
+  if (current?.hasText) return true;
+  return previous !== undefined && previous.hasText && !previous.hasToolCalls;
 }
 
 export function isTerminatedSubagentError(message: AssistantMessage): boolean {
@@ -99,14 +138,42 @@ export default function emptyResponseRetry(pi: ExtensionAPI): void {
   globalState[EXTENSION_GUARD] = true;
 
   const state: RetryState = {
+    subagentDoneBlocks: 0,
     emptyAttempts: 0,
     triedFallbacks: new Set(),
     simulatedResponses: 0,
   };
 
+  pi.on("message_end", (event) => {
+    const message = event.message as AssistantMessage;
+    if (message.role !== "assistant") return;
+    state.previousAssistant = state.currentAssistant;
+    state.currentAssistant = summarizeAssistant(message);
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    if (event.toolName !== SUBAGENT_DONE_TOOL) return;
+
+    if (hasFinalAnswerForSubagentDone(state.currentAssistant, state.previousAssistant)) {
+      state.subagentDoneBlocks = 0;
+      return;
+    }
+
+    if (state.subagentDoneBlocks >= MAX_SUBAGENT_DONE_BLOCKS) {
+      notify(ctx, "subagent_done still has no final text; allowing it", "warning");
+      state.subagentDoneBlocks = 0;
+      return;
+    }
+
+    state.subagentDoneBlocks += 1;
+    notify(ctx, "subagent_done without a final text answer; asking the model to write one", "info");
+    return { block: true, reason: SUBAGENT_DONE_BLOCK_REASON };
+  });
+
   pi.on("turn_end", async (event, ctx) => {
     const message = event.message;
-    const limit = simulationLimit();
+    const subagent = isSubagentSession();
+    const limit = subagent ? simulationLimit() : 0;
     const simulated = message.role === "assistant" && message.stopReason === "stop" && state.simulatedResponses < limit;
     if (simulated) state.simulatedResponses += 1;
 
@@ -123,12 +190,8 @@ export default function emptyResponseRetry(pi: ExtensionAPI): void {
       state.extensionModel !== undefined && modelKey(state.extensionModel) === opusKey;
     const shouldFallbackToOpus = terminatedSubagentError || webSocketIdleTimeoutError;
     const shouldFallbackToGemini = message.stopReason === "error" && afterOpus;
-    if (
-      !simulated &&
-      !isEmptyAssistantMessage(message) &&
-      !shouldFallbackToOpus &&
-      !shouldFallbackToGemini
-    ) {
+    const emptyRetry = subagent && (simulated || isEmptyAssistantMessage(message));
+    if (!emptyRetry && !shouldFallbackToOpus && !shouldFallbackToGemini) {
       resetAttempts(state);
       return;
     }
@@ -221,6 +284,7 @@ export default function emptyResponseRetry(pi: ExtensionAPI): void {
     state.originalModel = undefined;
     state.extensionModel = undefined;
     state.simulatedResponses = 0;
+    state.subagentDoneBlocks = 0;
     resetAttempts(state);
   });
 }
