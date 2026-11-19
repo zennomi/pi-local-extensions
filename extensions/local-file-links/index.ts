@@ -3,6 +3,7 @@ import { parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { GFM, parser } from "@lezer/markdown";
+import { workspaceLinkWidget } from "./workspace-opener.js";
 
 const markdownParser = parser.configure(GFM);
 
@@ -48,7 +49,13 @@ export function fixLocalLinks(markdown: string, cwd: string): string {
 
 export default function localFileLinks(pi: ExtensionAPI) {
   let cwd = process.cwd();
-  pi.on("session_start", (_event, ctx) => { cwd = ctx.cwd; });
+  pi.on("session_start", (_event, ctx) => {
+    cwd = ctx.cwd;
+    if (process.platform === "darwin" && ctx.hasUI) {
+      ctx.ui.setWidget("local-file-links:workspace-opener", tui =>
+        workspaceLinkWidget(tui, ctx.cwd, msg => ctx.ui.notify(msg, "warning")), { placement: "belowEditor" });
+    }
+  });
   pi.registerMarkdownTransformer((markdown, ctx) =>
     ctx.isStreaming || ctx.messageType === "assistant-thinking" ? markdown : fixLocalLinks(markdown, cwd));
 }
