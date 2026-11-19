@@ -10,6 +10,7 @@ independent and can be loaded or disabled separately.
 | [browser-autoconnect](./extensions/browser-autoconnect/README.md) | `extensions/browser-autoconnect/index.ts` | Runs `/browser-setup` at interactive startup when `pi-browser-harness` is enabled |
 | [cliproxy-tool-alias](./extensions/cliproxy-tool-alias/README.md) | `extensions/cliproxy-tool-alias/index.ts` | Restores tool names that CLIProxyAPI Claude cloaking leaves aliased (`zebra_write` → `write`) |
 | [export-open](./extensions/export-open/README.md) | `extensions/export-open/index.ts` | `/export-open`: exports session HTML to `/tmp` using Pi's exporter, then opens it in the default browser |
+| [local-file-links](./extensions/local-file-links/README.md) | `extensions/local-file-links/index.ts` | Makes workspace-relative Markdown links clickable in fullscreen |
 
 ## Layout
 
