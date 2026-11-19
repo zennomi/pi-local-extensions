@@ -7,7 +7,6 @@
     "extensions": [
       "./extensions/web-fetch/index.ts",
       "./extensions/browser-autoconnect/index.ts",
-      "./extensions/empty-response-retry/index.ts",
       "./extensions/cliproxy-tool-alias/index.ts",
       "./extensions/export-open/index.ts"
     ]
